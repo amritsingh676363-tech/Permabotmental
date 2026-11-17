@@ -60,25 +60,93 @@ TOTAL_NAME_CHANGES = 0
 GLOBAL_BOT_IDX = 0
 SPEED_MODE = "perma"  # "perma" = Guaranteed <3.3GB/month (110MB/day hard shield) | "turbo" = War speed
 
-# 2.0 Hard Daily Bandwidth Shield (Guarantees NEVER crossing 5 GB / month on Render!)
+# 2.0 Hard Persistent Daily Bandwidth Shield (Guarantees NEVER crossing 5 GB / month on Render!)
 DAILY_SAFE_MB = 110.0  # 110 MB/day * 30 = 3.3 GB max (leaves 1.7 GB safety cushion under 5 GB)
-daily_bw = {
-    "date": datetime.datetime.utcnow().strftime("%Y-%m-%d"),
-    "bytes": 0,
-}
+DAILY_BW_FILE = "daily_bw.txt"
+_bw_flush_counter = 0
+
+def load_daily_bw() -> Dict:
+    today = datetime.datetime.utcnow().strftime("%Y-%m-%d")
+    if os.path.exists(DAILY_BW_FILE):
+        try:
+            with open(DAILY_BW_FILE, "r", encoding="utf-8") as f:
+                raw = f.read().strip()
+            if "," in raw:
+                d_str, b_str = raw.split(",", 1)
+                if d_str.strip() == today and b_str.strip().isdigit():
+                    return {"date": today, "bytes": int(b_str.strip())}
+        except Exception:
+            pass
+    return {"date": today, "bytes": 0}
+
+daily_bw = load_daily_bw()
+
+def save_daily_bw():
+    try:
+        with open(DAILY_BW_FILE, "w", encoding="utf-8") as f:
+            f.write(f"{daily_bw['date']},{daily_bw['bytes']}\n")
+    except Exception:
+        pass
 
 def add_wire_bytes(estimated_bytes: int):
+    global _bw_flush_counter
     today = datetime.datetime.utcnow().strftime("%Y-%m-%d")
     if daily_bw["date"] != today:
         daily_bw["date"] = today
         daily_bw["bytes"] = 0
+        save_daily_bw()
     daily_bw["bytes"] += estimated_bytes
+    _bw_flush_counter += 1
+    if _bw_flush_counter >= 200:
+        _bw_flush_counter = 0
+        save_daily_bw()
 
 def get_daily_mb() -> float:
     today = datetime.datetime.utcnow().strftime("%Y-%m-%d")
     if daily_bw["date"] != today:
         return 0.0
     return round(daily_bw["bytes"] / (1024 * 1024), 2)
+
+def get_shield_tier() -> str:
+    mb = get_daily_mb()
+    if mb >= 108.0:
+        return "🔒 Survival Hold (0.25/s)"
+    if mb >= 95.0:
+        return "⚠️ Eco-Coast (0.85/s)"
+    return "🛡️ Shield OK (1.55/s)"
+
+def get_per_gc_cadence_str() -> str:
+    count = max(1, len(active_tasks))
+    mb = get_daily_mb()
+    if SPEED_MODE == "turbo":
+        sec = 0.72 if count <= 2 else max(0.85, round(count * 0.35, 1))
+    else:
+        if mb >= 108.0:
+            gap = 4.0
+        elif mb >= 95.0:
+            gap = 1.18
+        else:
+            gap = 0.645
+        sec = max(0.95, round(count * gap, 1))
+    return f"~{sec}s / GC ({count} Live)"
+
+def get_monthly_proj_gb() -> float:
+    count = len(active_tasks)
+    if count == 0:
+        return 0.3
+    mb = get_daily_mb()
+    if SPEED_MODE == "turbo":
+        est_daily_mb = min(350.0, count * 32.0)
+    else:
+        if mb >= 108.0:
+            est_daily_mb = 110.0
+        elif count == 1:
+            est_daily_mb = 48.0
+        elif count <= 3:
+            est_daily_mb = 75.0
+        else:
+            est_daily_mb = 92.0  # Global 1.55 req/s + batched polling (~92 MB/day = ~2.76 GB/month)
+    return round((max(mb, est_daily_mb) * 30.0) / 1024.0, 2)
 
 # 2.1 Lightweight Known Group Tracker (Zero-Storage, < 1 KB)
 KNOWN_GROUPS_FILE = "known_groups.txt"
@@ -267,32 +335,76 @@ def make_stylish_name(base: str, last_cache: List[str]) -> str:
             return styled
     return f"{base} {random.choice(SUFFIXES)}"
 
-# 6. NC Rename Loop (Non-Stop 24/7/365 Multi-GC Engine)
+# 6. Global Token-Bucket Rate Gate & Non-Stop Multi-GC Engine
+_rate_lock: asyncio.Lock = None  # Initialized inside running event loop
+_next_slot_ts: float = 0.0
+
+async def acquire_global_nc_slot(stop_event: asyncio.Event, last_gc_ts: float):
+    global _rate_lock, _next_slot_ts
+    if _rate_lock is None:
+        _rate_lock = asyncio.Lock()
+
+    mb = get_daily_mb()
+    if SPEED_MODE == "turbo":
+        global_gap = 0.35
+        per_gc_floor = 0.72
+    else:
+        # 3-Tier 110 MB/day Perma Shield Curve
+        if mb >= 108.0:
+            global_gap = 4.0      # Survival Hold: 0.25 req/sec total until UTC midnight
+        elif mb >= 95.0:
+            global_gap = 1.18     # Eco-Coast: 0.85 req/sec total
+        else:
+            global_gap = 0.645    # Balanced Perma: 1.55 req/sec total across all 15-20 GCs
+        per_gc_floor = 0.95
+
+    async with _rate_lock:
+        now = time.monotonic()
+        target_ts = max(now, _next_slot_ts + global_gap, last_gc_ts + per_gc_floor)
+        _next_slot_ts = target_ts
+
+    wait_sec = target_ts - time.monotonic()
+    if wait_sec > 0:
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=wait_sec)
+        except asyncio.TimeoutError:
+            pass
+
 async def nc_loop(client, chat_id: int, base: str, stop_event: asyncio.Event):
     global TOTAL_NAME_CHANGES, GLOBAL_BOT_IDX
     last_cache = [""]
+    last_gc_ts = 0.0
 
-    # Initial micro-jitter to prevent 50+ groups from colliding at the exact same millisecond
-    await asyncio.sleep(random.uniform(0.05, 0.8))
+    # Initial micro-jitter so 15-20 groups interleave smoothly on startup
+    await asyncio.sleep(random.uniform(0.05, 0.9))
 
     while not stop_event.is_set():
         if not BOT_TOKENS:
             await asyncio.sleep(2.0)
             continue
 
+        # Wait for our shared global token-bucket slot before firing
+        await acquire_global_nc_slot(stop_event, last_gc_ts)
+        if stop_event.is_set():
+            break
+
+        last_gc_ts = time.monotonic()
         new_title = make_stylish_name(base, last_cache)
-        token = BOT_TOKENS[0]
+
+        # Round-robin rotation across all configured BOT_TOKENS
+        GLOBAL_BOT_IDX = (GLOBAL_BOT_IDX + 1) % len(BOT_TOKENS)
+        token = BOT_TOKENS[GLOBAL_BOT_IDX]
         retry_delay = 0.0
 
         try:
             url = f"https://api.telegram.org/bot{token}/setChatTitle"
             raw_body = json.dumps({"chat_id": chat_id, "title": new_title}, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-            add_wire_bytes(len(raw_body) + 380)  # Count body + TLS/HTTP2/TCP wire overhead conservatively
+            add_wire_bytes(len(raw_body) + 380)  # Body + TLS/HTTP2/TCP wire overhead
             resp = await client.post(
                 url,
                 content=raw_body,
                 headers={"Content-Type": "application/json", "Accept-Encoding": "gzip, deflate, br", "Connection": "keep-alive"},
-                timeout=2.0
+                timeout=2.2
             )
             data = resp.json()
             if data.get("ok"):
@@ -309,34 +421,11 @@ async def nc_loop(client, chat_id: int, base: str, stop_event: asyncio.Event):
         except Exception:
             pass
 
-        # ⚡ IRONCLAD 30-DAY 5GB PERMA SHIELD:
-        # Global max ~1.6 req/sec in PERMA mode (~70-95 MB/day = 2.1 - 2.9 GB/month across ANY number of groups!)
-        # If daily usage hits 90% of daily budget (100 MB), auto-throttle smoothly so 5 GB is NEVER crossed!
         if retry_delay > 0:
-            sleep_sec = retry_delay + 0.15
-        elif SPEED_MODE == "turbo":
-            active_count = len(active_tasks)
-            sleep_sec = 0.72 if active_count <= 2 else max(0.85, round(active_count * 0.14, 2))
-        else:
-            active_count = len(active_tasks)
-            if active_count <= 1:
-                sleep_sec = 0.95  # 1 group: fast & guaranteed ~1.4 GB/month
-            elif active_count == 2:
-                sleep_sec = 1.35
-            elif active_count == 3:
-                sleep_sec = 1.90
-            else:
-                # 4 to 50 groups: 0.62s per group => global rate <= 1.61 req/s (~2.2 - 2.8 GB/month total!)
-                sleep_sec = max(2.2, round(active_count * 0.62, 2))
-
-            # Hard daily byte shield: if today's budget is nearly full, double spacing for rest of the day
-            if get_daily_mb() >= (DAILY_SAFE_MB * 0.90):
-                sleep_sec = round(sleep_sec * 2.0, 2)
-
-        try:
-            await asyncio.wait_for(stop_event.wait(), timeout=sleep_sec)
-        except asyncio.TimeoutError:
-            pass
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=retry_delay + 0.2)
+            except asyncio.TimeoutError:
+                pass
 
 # 7. Helper to send messages
 async def send_msg(client, token: str, chat_id: int, text: str):
@@ -466,14 +555,16 @@ async def handle_update(client, update: dict):
             f"  ◈ 𝐃𝐢𝐬𝐤     : `0.0 MB` (Pure RAM)\n\n"
             f"───〔 𝟓𝐆𝐁 𝐁𝐀𝐍𝐃𝐖𝐈𝐃𝐓𝐇 𝐒𝐇𝐈𝐄𝐋𝐃 〕───\n"
             f"  ◈ 𝐓𝐨𝐝𝐚𝐲    : `{get_daily_mb()} MB` / `{int(DAILY_SAFE_MB)} MB Cap`\n"
-            f"  ◈ 𝐆𝐞𝐚𝐫     : `{SPEED_MODE.upper()} ({'30-Day <3.3GB Safe' if SPEED_MODE == 'perma' else '0.72s War Speed'})`\n"
+            f"  ◈ 𝐒𝐡𝐢𝐞𝐥𝐝   : `{get_shield_tier()}`\n"
+            f"  ◈ 𝟑𝟎𝐝 𝐏𝐫𝐨𝐣 : `~{get_monthly_proj_gb()} GB / 5.0 GB`\n"
+            f"  ◈ 𝐏𝐚𝐜𝐞     : `{get_per_gc_cadence_str()}`\n"
             f"  ◈ 𝐋𝐚𝐬𝐭 𝐏𝐮𝐫𝐠𝐞: `{daily_reset_stats['last_reset_time']}`\n"
             f"  ◈ 𝐍𝐞𝐱𝐭 𝐏𝐮𝐫𝐠𝐞: `{get_next_reset_str()}`\n\n"
             f"───〔 𝐍𝐂 𝐌𝐀𝐓𝐑𝐈𝐗 〕───\n"
             f"  ◈ 𝐀𝐜𝐭𝐢𝐯𝐞   : `{len(active_tasks)}` / `{len(known_groups)}` GCs\n"
             f"  ◈ 𝐑𝐞𝐧𝐚𝐦𝐞𝐬  : `{TOTAL_NAME_CHANGES}`\n"
-            f"  ◈ 𝐒𝐮𝐝𝐨𝐬    : `{len(sudo_users)}` | 𝐁𝐨𝐭𝐬: `{len(BOT_TOKENS)}`\n"
-            f"  ◈ 𝐔𝐩𝐭𝐢𝐦𝐞   : `{uptime_str}`\n\n"
+            f"  ◈ 𝐆𝐞𝐚𝐫     : `{SPEED_MODE.upper()}` | 𝐁𝐨𝐭𝐬: `{len(BOT_TOKENS)}`\n"
+            f"  ◈ 𝐒𝐮𝐝𝐨𝐬    : `{len(sudo_users)}` | 𝐔𝐩𝐭𝐢𝐦𝐞: `{uptime_str}`\n\n"
             f"▚▚ ʜᴏꜱᴛᴇᴅ ʙʏ ᴀᴍʀɪᴛ • ᴍᴇɴᴛᴀʟꜱ ᴘᴇʀᴍᴀ ▞▞"
         )
         await send_msg(client, primary_token, chat_id, report)
@@ -564,8 +655,8 @@ async def handle_update(client, update: dict):
             f"▙▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▟\n\n"
             f"  ◈ 𝐒𝐓𝐀𝐓𝐔𝐒 ▸ {status}\n"
             f"  ◈ 𝐆𝐄𝐀𝐑   ▸ `{gear_tag}`\n"
-            f"  ◈ 𝐀𝐂𝐓𝐈𝐕𝐄 ▸ `{len(active_tasks)} GCs Live`\n"
-            f"  ◈ 𝐃𝐀𝐓𝐀   ▸ `{get_daily_mb()} MB` / `{int(DAILY_SAFE_MB)} MB`\n\n"
+            f"  ◈ 𝐏𝐀𝐂𝐄   ▸ `{get_per_gc_cadence_str()}`\n"
+            f"  ◈ 𝐃𝐀𝐓𝐀   ▸ `{get_daily_mb()} MB` / `{int(DAILY_SAFE_MB)} MB` (`~{get_monthly_proj_gb()}GB/mo`)\n\n"
             f"───〔 𝐐𝐔𝐈𝐂𝐊 𝐂𝐎𝐍𝐓𝐑𝐎𝐋𝐒 〕───\n"
             f"  ▸ `/nc <name>` ⇝ Fire NC Here\n"
             f"  ▸ `/nc <gc_id> - <name>` ⇝ Remote GC Fire\n"
@@ -772,8 +863,8 @@ async def handle_update(client, update: dict):
             f"▙▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▟\n\n"
             f"  ◈ 𝐆𝐫𝐨𝐮𝐩  : {target_label}\n"
             f"  ◈ 𝐓𝐚𝐫𝐠𝐞𝐭 : `{nc_name}`\n"
-            f"  ◈ 𝐆𝐞𝐚𝐫   : `{SPEED_MODE.upper()} ({'5GB 30-Day Safe' if SPEED_MODE == 'perma' else '0.72s War'})`\n"
-            f"  ◈ 𝐒𝐡𝐢𝐞𝐥𝐝 : `Daily 110 MB Cap Active`\n"
+            f"  ◈ 𝐏𝐚𝐜𝐞   : `{get_per_gc_cadence_str()}`\n"
+            f"  ◈ 𝐒𝐡𝐢𝐞𝐥𝐝 : `Daily 110 MB Cap (~{get_monthly_proj_gb()}GB/mo)`\n"
             f"  ◈ 𝐒𝐭𝐨𝐩   : `{stop_hint}`\n\n"
             f"▚▚ ʜᴏꜱᴛᴇᴅ ʙʏ ᴀᴍʀɪᴛ • 24×7 ɴᴏɴ-ꜱᴛᴏᴘ ▞▞"
         )
@@ -917,8 +1008,10 @@ async def main():
                             if len(seen_update_ids) > 100:
                                 seen_update_ids = set(sorted(list(seen_update_ids))[-30:])
                             asyncio.create_task(handle_update(client, u))
-                if active_tasks:
-                    await asyncio.sleep(2.5)
+                if len(active_tasks) >= 5:
+                    await asyncio.sleep(3.0)
+                elif active_tasks:
+                    await asyncio.sleep(2.0)
             except Exception:
                 await asyncio.sleep(2.0)
 
